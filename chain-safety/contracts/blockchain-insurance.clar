@@ -17,6 +17,7 @@
 (define-constant ERR-INSURANCE-POOL-EMPTY (err u109))
 (define-constant ERR-CLAIM-NOT-EXPIRED (err u110))
 (define-constant ERR-CLAIM-EXCEEDS-COVERAGE (err u111))
+(define-constant ERR-TRANSFER-FAILED (err u112))
 
 ;; System constants
 (define-constant CLAIM-EXPIRATION-PERIOD u4320) ;; 30 days in blocks (assuming 10-minute block times)
@@ -35,16 +36,18 @@
 
 ;; Function for clients to purchase insurance coverage
 (define-public (purchase-insurance (coverage-amount uint))
-  (let ((client-address tx-sender))
+  (let ((client-address tx-sender)
+        (current-coverage (default-to u0 (map-get? insured-clients client-address))))
     (asserts! (> coverage-amount u0) ERR-ZERO-AMOUNT)
-    (asserts! (is-none (map-get? insured-clients client-address)) ERR-ALREADY-INSURED)
+    
+    ;; Allow adding to existing coverage
     (match (stx-transfer? coverage-amount client-address (as-contract tx-sender))
       success (begin
         (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) coverage-amount))
-        (map-set insured-clients client-address coverage-amount)
-        (print { event: "insurance-purchased", insured-amount: coverage-amount, client: client-address })
+        (map-set insured-clients client-address (+ current-coverage coverage-amount))
+        (print { event: "insurance-purchased", insured-amount: coverage-amount, total-coverage: (+ current-coverage coverage-amount), client: client-address })
         (ok true))
-      error (err error))))
+      error ERR-TRANSFER-FAILED)))
 
 ;; Function for clients to submit insurance claims
 (define-public (submit-claim (claim-amount uint))
@@ -89,16 +92,31 @@
     (let ((payout-amount (calculate-payout-amount claim-amount available-funds)))
       (match (as-contract (stx-transfer? payout-amount tx-sender client-address))
         success (begin
+          ;; Update pool balance
           (var-set insurance-pool-balance (- available-funds payout-amount))
-          (if (< payout-amount claim-amount)
-              (map-set insurance-claims claim-identifier 
-                { claim-status: "partial-payment", submission-timestamp: block-height, paid-amount: payout-amount })
-              (begin
-                (map-delete insurance-claims claim-identifier)
-                (map-delete insured-clients client-address)))
-          (print { event: "claim-approved", client: client-address, claim-amount: claim-amount, payout: payout-amount })
-          (ok payout-amount))
-        error (err error)))))
+          
+          ;; Update client's remaining coverage
+          (let ((remaining-coverage (- insured-amount payout-amount)))
+            ;; Handle both partial and full payments consistently
+            (if (> remaining-coverage u0)
+                ;; For partial payments, update the remaining coverage
+                (map-set insured-clients client-address remaining-coverage)
+                ;; For full payments or if remaining coverage is zero, remove client
+                (map-delete insured-clients client-address))
+            
+            ;; Update claim record
+            (map-set insurance-claims claim-identifier 
+              { claim-status: (if (< payout-amount claim-amount) "partial-payment" "paid"), 
+                submission-timestamp: block-height, 
+                paid-amount: payout-amount })
+            
+            (print { event: "claim-approved", 
+                     client: client-address, 
+                     claim-amount: claim-amount, 
+                     payout: payout-amount,
+                     remaining-coverage: remaining-coverage })
+            (ok payout-amount)))
+        error ERR-TRANSFER-FAILED))))
 
 ;; Function for administrators to deny claims
 (define-public (deny-claim (client-address principal) (claim-amount uint))
@@ -122,14 +140,13 @@
     (claim-identifier { client-address: client-address, claim-amount: claim-amount })
     (claim-record (unwrap! (map-get? insurance-claims claim-identifier) ERR-CLAIM-NOT-FOUND))
   )
-    (if (and (is-eq (get claim-status claim-record) "pending")
-             (>= (- block-height (get submission-timestamp claim-record)) CLAIM-EXPIRATION-PERIOD))
-        (begin
-          (map-set insurance-claims claim-identifier 
-            { claim-status: "expired", submission-timestamp: (get submission-timestamp claim-record), paid-amount: u0 })
-          (print { event: "claim-expired", client: client-address, claim-amount: claim-amount })
-          (ok true))
-        (ok false))))
+    (asserts! (>= (- block-height (get submission-timestamp claim-record)) CLAIM-EXPIRATION-PERIOD) ERR-CLAIM-NOT-EXPIRED)
+    (asserts! (is-eq (get claim-status claim-record) "pending") ERR-CLAIM-ALREADY-PROCESSED)
+    
+    (map-set insurance-claims claim-identifier 
+      { claim-status: "expired", submission-timestamp: (get submission-timestamp claim-record), paid-amount: u0 })
+    (print { event: "claim-expired", client: client-address, claim-amount: claim-amount })
+    (ok true)))
 
 ;; Function for transferring administrator privileges
 (define-public (transfer-admin-rights (new-admin-address principal))
@@ -138,6 +155,21 @@
     (asserts! (not (is-eq new-admin-address 'SP000000000000000000002Q6VF78)) ERR-INVALID-PRINCIPAL)
     (print { event: "admin-transferred", previous-admin: (var-get system-administrator), new-admin: new-admin-address })
     (ok (var-set system-administrator new-admin-address))))
+
+;; Admin function to withdraw funds from the insurance pool
+(define-public (admin-withdraw-funds (amount uint))
+  (let ((admin-address tx-sender)
+        (current-balance (var-get insurance-pool-balance)))
+    (asserts! (is-eq admin-address (var-get system-administrator)) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    (asserts! (<= amount current-balance) ERR-INSUFFICIENT-FUNDS)
+    
+    (match (as-contract (stx-transfer? amount tx-sender admin-address))
+      success (begin
+        (var-set insurance-pool-balance (- current-balance amount))
+        (print { event: "admin-withdrawal", amount: amount, admin: admin-address })
+        (ok true))
+      error ERR-TRANSFER-FAILED)))
 
 ;; Read-only Functions
 
